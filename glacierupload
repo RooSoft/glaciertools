@@ -22,7 +22,8 @@ readonly MB=1048576
 
 function print_usage {
   echo "usage: glacierupload -v|--vault <vault> [-p|--profile <profile>]"
-  echo "        [-d|--description <description>] [-s|--split-size <level>] <file>"
+  echo "        [-d|--description <description>] [-s|--split-size <level>]"
+  echo "        [--verbosity <level>] <file>"
   echo ""
   echo "Upload a file to a vault in AWS glacier."
   echo ""
@@ -35,6 +36,9 @@ function print_usage {
   echo "                   0 and 22 and results in part size of (2^level) MBytes."
   echo "                   If not specified the default is 0, i.e. the file is"
   echo "                   uploaded in 1MByte parts."
+  echo "    --verbosity    print diagnostic messages to stderr if level is larger than 0:"
+  echo "                     * level 1: Print the SHA256 hash when upload is successful"
+  echo "                     * level 2: Print debug information"
   echo "    --help         print this message"
 }
 
@@ -67,6 +71,11 @@ while [[ $# -gt 0 ]]; do
       shift # past argument
       shift # past value
       ;;
+      --verbosity)
+      arg_verbosity="$2"
+      shift # past argument
+      shift # past value
+      ;;
       *)    # unknown option
       arg_positional+=("$1") # save it in an array for later
       shift # past argument
@@ -74,14 +83,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-
 if [ -z "$arg_vault" ]; then
-  echo "No vault specified!"
+  echo "No vault specified!" >&2
   print_usage
   exit 1
 fi
 if [ ${#arg_positional[@]} -eq 0 ]; then
-  echo "No file specified!"
+  echo "No file specified!" >&2
   print_usage
   exit 1
 fi
@@ -94,6 +102,7 @@ readonly profile="${arg_profile:-}"
 readonly vault="$arg_vault"
 readonly description="${arg_description:-}"
 readonly split_size=${arg_split:-0}
+readonly log=$arg_verbosity
 
 ##########
 # Utility functions
@@ -123,12 +132,14 @@ function multipart_upload {
   local -r part_size=$(( 2**split_size * MB ))
   local -r file_size=$(wc -c < "$archive")
 
-  echo ""
-  echo "---------------------------------------"
-  echo "Upload $archive"
-  echo "Total upload (bytes): $file_size"
-  echo "---------------------------------------"
-  echo ""
+  if [[ $log -gt 1 ]] ; then
+    echo ""
+    echo "---------------------------------------"
+    echo "Upload $archive"
+    echo "Total upload (bytes): $file_size"
+    echo "---------------------------------------"
+    echo ""
+  fi 
 
   # initiate multipart upload connection to glacier
   init_args=()
@@ -158,13 +169,14 @@ function multipart_upload {
   # Upload parts
   #########
 
-  echo "Start upload $upload_id"
+  ((log > 1)) && echo "Start upload $upload_id" || :
 
   # Create parts in a temporary directory
   tmp_dir="$(mktemp -d)"
   cd "$tmp_dir" || exit 1
-  echo "From temporary directory: $tmp_dir"
-  echo ""
+
+  ((log > 1)) && echo "From temporary directory: $tmp_dir" || :
+  ((log > 1)) && echo "" || :
 
   # parallel runs in a subprocess
   export -f upload_part byte_range
@@ -186,8 +198,13 @@ function multipart_upload {
   local -r treehash="$(< treehash.sha)"
 
   # Return to original directory
-  echo -n "Returning to "
-  cd -
+  if [[ $log -gt 1 ]] ; then
+    echo -n "Returning to "
+    cd -
+  else
+    cd - > /dev/null
+  fi
+
   rm -rf "$tmp_dir"
 
 
@@ -195,9 +212,14 @@ function multipart_upload {
   # Finish upload
   #########
 
-  echo ""
-  echo "Complete upload $upload_id :"
-  echo ""
+  if [[ $log -gt 1 ]] ; then
+    echo ""
+    echo "Complete upload $upload_id :"
+    echo ""
+  fi
+
+  # Display SHA256 treehash
+  ((log > 0)) && echo $treehash || :
 
   complete_args=()
   if [[ -n "$profile" ]]; then
@@ -223,9 +245,9 @@ function multipart_upload {
     return $failure
   fi
 
-  echo "$result"
+  ((log > 1)) && echo "$result" || :
   local -r archive_id="$(echo "$result")"
-  echo "$result" > "$(basename "$archive").${archive_id:0:8}.upload.json"
+  ((log > 1)) && echo "$result" > "$(basename "$archive").${archive_id:0:8}.upload.json" || :
 }
 
 
@@ -237,7 +259,7 @@ function upload_part {
   count=$1
   range="$(byte_range "$count")"
 
-  echo "Uploading range $range ($(( ${range##*-}/part_size ))/$(( file_size/part_size )))"
+  ((log > 1)) && echo "Uploading range $range ($(( ${range##*-}/part_size ))/$(( file_size/part_size )))" || :
 
   upload_args=()
   if [[ -n "$profile" ]]; then
@@ -253,14 +275,14 @@ function upload_part {
   upload_args+=("$vault")
   upload_args+=("--upload-id=$upload_id")
 
-  aws "${upload_args[@]}"
+  aws "${upload_args[@]}" > /dev/null
 
   failure=$?
   if (($failure > 0)); then
     exit $failure
   fi
 
-  echo "Finished upload of range $range ($(( ${range##*-}/part_size ))/$(( file_size/part_size )))"
+  ((log > 1)) && echo "Finished upload of range $range ($(( ${range##*-}/part_size ))/$(( file_size/part_size )))" || :
 
   # Remove tmp file
   rm "$part"
